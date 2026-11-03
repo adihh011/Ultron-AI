@@ -14,6 +14,15 @@ load_dotenv()
 
 app = FastAPI(title="ULTRON Backend", version="0.1.0")
 
+
+def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Read an env var, stripping stray whitespace/newlines and wrapping quotes."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip().strip("\"'").strip()
+    return value or default
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -46,7 +55,7 @@ def build_system_prompt() -> str:
 
 
 def require_client_token(authorization: Optional[str]) -> None:
-    expected_token = os.getenv("ULTRON_API_TOKEN")
+    expected_token = get_env("ULTRON_API_TOKEN")
     if not expected_token:
         raise HTTPException(status_code=503, detail="Backend client authentication is not configured")
 
@@ -54,7 +63,7 @@ def require_client_token(authorization: Optional[str]) -> None:
     if (
         not separator
         or scheme.lower() != "bearer"
-        or not hmac.compare_digest(supplied_token, expected_token)
+        or not hmac.compare_digest(supplied_token.strip().encode(), expected_token.encode())
     ):
         raise HTTPException(status_code=401, detail="Invalid or missing backend token")
 
@@ -64,10 +73,10 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "ultron-backend",
-        "groq_configured": bool(os.getenv("GROQ_API_KEY")),
-        "fish_configured": bool(os.getenv("FISH_AUDIO_API_KEY")),
-        "client_auth_configured": bool(os.getenv("ULTRON_API_TOKEN")),
-        "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        "groq_configured": bool(get_env("GROQ_API_KEY")),
+        "fish_configured": bool(get_env("FISH_AUDIO_API_KEY")),
+        "client_auth_configured": bool(get_env("ULTRON_API_TOKEN")),
+        "model": get_env("GROQ_MODEL", "openai/gpt-oss-120b"),
     }
 
 
@@ -78,11 +87,11 @@ def chat(
 ) -> Dict[str, Any]:
     require_client_token(authorization)
 
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = get_env("GROQ_API_KEY")
     if not api_key:
         raise HTTPException(status_code=503, detail="GROQ_API_KEY is not configured")
 
-    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    model = get_env("GROQ_MODEL", "openai/gpt-oss-120b")
     history = request.history or []
     messages: List[Dict[str, str]] = [{"role": "system", "content": build_system_prompt()}]
     for item in history:
@@ -96,8 +105,11 @@ def chat(
         "model": model,
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 600,
+        "max_tokens": 1500,
     }
+    # gpt-oss models "think" before answering; keep that short so replies aren't cut off
+    if model.startswith("openai/gpt-oss"):
+        payload["reasoning_effort"] = "low"
 
     response = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -109,6 +121,11 @@ def chat(
         timeout=45,
     )
 
+    if response.status_code in (401, 403):
+        raise HTTPException(
+            status_code=502,
+            detail="GROQ_API_KEY was rejected by Groq (upstream 401/403). Check the key on the server.",
+        )
     if response.status_code >= 400:
         raise HTTPException(
             status_code=response.status_code,
@@ -136,15 +153,15 @@ def tts(
 ) -> Response:
     require_client_token(authorization)
 
-    api_key = os.getenv("FISH_AUDIO_API_KEY")
+    api_key = get_env("FISH_AUDIO_API_KEY")
     if not api_key:
         raise HTTPException(status_code=503, detail="FISH_AUDIO_API_KEY is not configured")
 
-    voice_id = request.voice_id or os.getenv("FISH_AUDIO_VOICE_ID")
+    voice_id = request.voice_id or get_env("FISH_AUDIO_VOICE_ID")
     if not voice_id:
         raise HTTPException(status_code=400, detail="FISH_AUDIO_VOICE_ID is not configured")
 
-    model = os.getenv("FISH_AUDIO_MODEL", "s2.1-pro-free")
+    model = get_env("FISH_AUDIO_MODEL", "s2.1-pro-free")
     payload = {
         "text": request.text,
         "reference_id": voice_id,
@@ -170,6 +187,11 @@ def tts(
         timeout=60,
     )
 
+    if response.status_code in (401, 403):
+        raise HTTPException(
+            status_code=502,
+            detail="FISH_AUDIO_API_KEY was rejected by Fish Audio (upstream 401/403). Check the key on the server.",
+        )
     if response.status_code >= 400:
         raise HTTPException(
             status_code=response.status_code,
@@ -193,4 +215,3 @@ def tts(
             return Response(content=audio_response.content, media_type="audio/mpeg")
 
     return Response(content=response.content, media_type=content_type)
-    
